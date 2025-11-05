@@ -1,0 +1,1050 @@
+#include "esp32_music.h"
+#include "board.h"
+#include "system_info.h"
+#include "audio/audio_codec.h"
+#include "application.h"
+#include "protocols/protocol.h"
+#include "display/display.h"
+
+#include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <esp_pthread.h>
+#include <esp_timer.h>
+#include <mbedtls/sha256.h>
+#include <cJSON.h>
+#include <cstring>
+#include <chrono>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <thread>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#define TAG "Esp32Music"
+
+// ========== Bảng chữ cái tiếng Việt và chuyển đổi ==========
+
+/**
+ * @brief Kiểm tra xem chuỗi có chứa ký tự tiếng Việt không
+ */
+static bool ContainsVietnamese(const std::string& text) {
+    const std::vector<std::string> vietnamese_chars = {
+        "á", "à", "ả", "ã", "ạ", "ă", "ắ", "ằ", "ẳ", "ẵ", "ặ",
+        "â", "ấ", "ầ", "ẩ", "ẫ", "ậ", "đ", "é", "è", "ẻ", "ẽ", "ẹ",
+        "ê", "ế", "ề", "ể", "ễ", "ệ", "í", "ì", "ỉ", "ĩ", "ị",
+        "ó", "ò", "ỏ", "õ", "ọ", "ô", "ố", "ồ", "ổ", "ỗ", "ộ",
+        "ơ", "ớ", "ờ", "ở", "ỡ", "ợ", "ú", "ù", "ủ", "ũ", "ụ",
+        "ư", "ứ", "ừ", "ử", "ữ", "ự", "ý", "ỳ", "ỷ", "ỹ", "ỵ"
+    };
+    
+    for (const auto& vn_char : vietnamese_chars) {
+        if (text.find(vn_char) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Phát hiện ngôn ngữ
+ */
+static std::string DetectLanguage(const std::string& text) {
+    if (ContainsVietnamese(text)) {
+        return "vietnamese";
+    }
+    
+    for (size_t i = 0; i < text.length(); i++) {
+        unsigned char c = text[i];
+        if (c >= 0xE4 && c <= 0xE9) {
+            return "chinese";
+        }
+    }
+    
+    return "unknown";
+}
+
+// ========== ESP32 Authentication ==========
+
+static std::string get_device_mac() {
+    return SystemInfo::GetMacAddress();
+}
+
+static std::string get_device_chip_id() {
+    std::string mac = SystemInfo::GetMacAddress();
+    mac.erase(std::remove(mac.begin(), mac.end(), ':'), mac.end());
+    return mac;
+}
+
+static std::string generate_dynamic_key(int64_t timestamp) {
+    const std::string secret_key = "your-esp32-secret-key-2024";
+    
+    std::string mac = get_device_mac();
+    std::string chip_id = get_device_chip_id();
+    std::string data = mac + ":" + chip_id + ":" + std::to_string(timestamp) + ":" + secret_key;
+    
+    unsigned char hash[32];
+    mbedtls_sha256((unsigned char*)data.c_str(), data.length(), hash, 0);
+    
+    std::string key;
+    for (int i = 0; i < 16; i++) {
+        char hex[3];
+        snprintf(hex, sizeof(hex), "%02X", hash[i]);
+        key += hex;
+    }
+    
+    return key;
+}
+
+static void add_auth_headers(Http* http) {
+    int64_t timestamp = esp_timer_get_time() / 1000000;
+    std::string dynamic_key = generate_dynamic_key(timestamp);
+    std::string mac = get_device_mac();
+    std::string chip_id = get_device_chip_id();
+    
+    if (http) {
+        http->SetHeader("X-MAC-Address", mac);
+        http->SetHeader("X-Chip-ID", chip_id);
+        http->SetHeader("X-Timestamp", std::to_string(timestamp));
+        http->SetHeader("X-Dynamic-Key", dynamic_key);
+        
+        ESP_LOGI(TAG, "Added auth headers - MAC: %s, ChipID: %s, Timestamp: %lld", 
+                 mac.c_str(), chip_id.c_str(), timestamp);
+    }
+}
+
+static std::string url_encode(const std::string& str) {
+    std::string encoded;
+    char hex[4];
+    
+    for (size_t i = 0; i < str.length(); i++) {
+        unsigned char c = str[i];
+        
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded += c;
+        } else if (c == ' ') {
+            encoded += '+';
+        } else {
+            snprintf(hex, sizeof(hex), "%%%02X", c);
+            encoded += hex;
+        }
+    }
+    return encoded;
+}
+
+static std::string buildUrlWithParams(const std::string& base_url, const std::string& path, const std::string& query) {
+    std::string result_url = base_url + path + "?";
+    size_t pos = 0;
+    size_t amp_pos = 0;
+    
+    while ((amp_pos = query.find("&", pos)) != std::string::npos) {
+        std::string param = query.substr(pos, amp_pos - pos);
+        size_t eq_pos = param.find("=");
+        
+        if (eq_pos != std::string::npos) {
+            std::string key = param.substr(0, eq_pos);
+            std::string value = param.substr(eq_pos + 1);
+            result_url += key + "=" + url_encode(value) + "&";
+        } else {
+            result_url += param + "&";
+        }
+        
+        pos = amp_pos + 1;
+    }
+    
+    std::string last_param = query.substr(pos);
+    size_t eq_pos = last_param.find("=");
+    
+    if (eq_pos != std::string::npos) {
+        std::string key = last_param.substr(0, eq_pos);
+        std::string value = last_param.substr(eq_pos + 1);
+        result_url += key + "=" + url_encode(value);
+    } else {
+        result_url += last_param;
+    }
+    
+    return result_url;
+}
+
+Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), current_song_name_(),
+                         song_name_displayed_(false), current_lyric_url_(), lyrics_(), 
+                         current_lyric_index_(-1), lyric_thread_(), is_lyric_running_(false),
+                         display_mode_(DISPLAY_MODE_LYRICS), is_playing_(false), is_downloading_(false), 
+                         play_thread_(), download_thread_(), audio_buffer_(), buffer_mutex_(), 
+                         buffer_cv_(), buffer_size_(0), mp3_decoder_(nullptr), mp3_frame_info_(), 
+                         mp3_decoder_initialized_(false) {
+    ESP_LOGI(TAG, "Xiaozhi music player - Vietnamese support initialized");
+    InitializeMp3Decoder();
+}
+
+Esp32Music::~Esp32Music() {
+    ESP_LOGI(TAG, "Destroying music player");
+    
+    is_downloading_ = false;
+    is_playing_ = false;
+    is_lyric_running_ = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        buffer_cv_.notify_all();
+    }
+    
+    if (download_thread_.joinable()) {
+        auto start_time = std::chrono::steady_clock::now();
+        bool thread_finished = false;
+        while (!thread_finished) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_time).count();
+            
+            if (elapsed >= 5) {
+                ESP_LOGW(TAG, "Download thread timeout");
+                break;
+            }
+            
+            is_downloading_ = false;
+            {
+                std::lock_guard<std::mutex> lock(buffer_mutex_);
+                buffer_cv_.notify_all();
+            }
+            
+            if (!download_thread_.joinable()) {
+                thread_finished = true;
+            }
+        }
+        
+        if (download_thread_.joinable()) {
+            download_thread_.join();
+        }
+    }
+    
+    if (play_thread_.joinable()) {
+        auto start_time = std::chrono::steady_clock::now();
+        bool thread_finished = false;
+        while (!thread_finished) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_time).count();
+            
+            if (elapsed >= 3) {
+                ESP_LOGW(TAG, "Playback thread timeout");
+                break;
+            }
+            
+            is_playing_ = false;
+            {
+                std::lock_guard<std::mutex> lock(buffer_mutex_);
+                buffer_cv_.notify_all();
+            }
+            
+            if (!play_thread_.joinable()) {
+                thread_finished = true;
+            }
+        }
+        
+        if (play_thread_.joinable()) {
+            play_thread_.join();
+        }
+    }
+    
+    if (lyric_thread_.joinable()) {
+        lyric_thread_.join();
+    }
+    
+    ClearAudioBuffer();
+    CleanupMp3Decoder();
+}
+
+bool Esp32Music::Download(const std::string& song_name, const std::string& artist_name) {
+    ESP_LOGI(TAG, "Xiaozhi Open Source Music - Vietnamese Support");
+    ESP_LOGI(TAG, "Getting music: %s", song_name.c_str());
+    
+    std::string detected_lang = DetectLanguage(song_name);
+    ESP_LOGI(TAG, "Detected language: %s", detected_lang.c_str());
+    
+    last_downloaded_data_.clear();
+    current_song_name_ = song_name;
+    
+    std::string base_url = "http://www.xiaozhishop.xyz:5005";
+    std::string query_params = "song=" + url_encode(song_name) + "&artist=" + url_encode(artist_name);
+    
+    if (detected_lang == "vietnamese") {
+        query_params += "&prefer_language=vietnamese&language_priority=vi,zh";
+        ESP_LOGI(TAG, "Vietnamese detected - prioritizing Vietnamese music");
+    }
+    
+    std::string full_url = base_url + "/stream_pcm?" + query_params;
+    
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    
+    http->SetHeader("User-Agent", "ESP32-Music-Vietnamese/1.0");
+    http->SetHeader("Accept", "application/json");
+    http->SetHeader("Accept-Language", "vi-VN,vi;q=0.9,en;q=0.8");
+    
+    add_auth_headers(http.get());
+    
+    if (!http->Open("GET", full_url)) {
+        ESP_LOGE(TAG, "Failed to connect");
+        return false;
+    }
+    
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "HTTP failed: %d", status_code);
+        http->Close();
+        return false;
+    }
+    
+    last_downloaded_data_ = http->ReadAll();
+    http->Close();
+    
+    if (!last_downloaded_data_.empty()) {
+        cJSON* response_json = cJSON_Parse(last_downloaded_data_.c_str());
+        if (response_json) {
+            cJSON* audio_url = cJSON_GetObjectItem(response_json, "audio_url");
+            cJSON* lyric_url = cJSON_GetObjectItem(response_json, "lyric_url");
+            cJSON* language = cJSON_GetObjectItem(response_json, "language");
+            
+            if (cJSON_IsString(language)) {
+                ESP_LOGI(TAG, "Music language: %s", language->valuestring);
+                
+                if (detected_lang == "vietnamese" && 
+                    strcmp(language->valuestring, "chinese") == 0) {
+                    ESP_LOGW(TAG, "Warning: Vietnamese requested but Chinese received");
+                }
+            }
+            
+            if (cJSON_IsString(audio_url) && audio_url->valuestring && strlen(audio_url->valuestring) > 0) {
+                std::string audio_path = audio_url->valuestring;
+                
+                if (audio_path.find("?") != std::string::npos) {
+                    size_t query_pos = audio_path.find("?");
+                    std::string path = audio_path.substr(0, query_pos);
+                    std::string query = audio_path.substr(query_pos + 1);
+                    current_music_url_ = buildUrlWithParams(base_url, path, query);
+                } else {
+                    current_music_url_ = base_url + audio_path;
+                }
+                
+                song_name_displayed_ = false;
+                StartStreaming(current_music_url_);
+                
+                if (cJSON_IsString(lyric_url) && lyric_url->valuestring && strlen(lyric_url->valuestring) > 0) {
+                    std::string lyric_path = lyric_url->valuestring;
+                    if (lyric_path.find("?") != std::string::npos) {
+                        size_t query_pos = lyric_path.find("?");
+                        std::string path = lyric_path.substr(0, query_pos);
+                        std::string query = lyric_path.substr(query_pos + 1);
+                        current_lyric_url_ = buildUrlWithParams(base_url, path, query);
+                    } else {
+                        current_lyric_url_ = base_url + lyric_path;
+                    }
+                    
+                    if (display_mode_ == DISPLAY_MODE_LYRICS) {
+                        if (is_lyric_running_) {
+                            is_lyric_running_ = false;
+                            if (lyric_thread_.joinable()) {
+                                lyric_thread_.join();
+                            }
+                        }
+                        
+                        is_lyric_running_ = true;
+                        current_lyric_index_ = -1;
+                        lyrics_.clear();
+                        
+                        lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+                    }
+                }
+                
+                cJSON_Delete(response_json);
+                return true;
+            } else {
+                ESP_LOGE(TAG, "No audio URL found");
+                cJSON_Delete(response_json);
+                return false;
+            }
+        }
+    }
+    
+    return false;
+}
+
+std::string Esp32Music::GetDownloadResult() {
+    return last_downloaded_data_;
+}
+
+bool Esp32Music::StartStreaming(const std::string& music_url) {
+    if (music_url.empty()) {
+        return false;
+    }
+    
+    is_downloading_ = false;
+    is_playing_ = false;
+    
+    if (download_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            buffer_cv_.notify_all();
+        }
+        download_thread_.join();
+    }
+    if (play_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            buffer_cv_.notify_all();
+        }
+        play_thread_.join();
+    }
+    
+    ClearAudioBuffer();
+    
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.stack_size = 8192;
+    cfg.prio = 5;
+    cfg.thread_name = "audio_stream";
+    esp_pthread_set_cfg(&cfg);
+    
+    is_downloading_ = true;
+    download_thread_ = std::thread(&Esp32Music::DownloadAudioStream, this, music_url);
+    
+    is_playing_ = true;
+    play_thread_ = std::thread(&Esp32Music::PlayAudioStream, this);
+    
+    return true;
+}
+
+bool Esp32Music::StopStreaming() {
+    ESP_LOGI(TAG, "Stopping streaming");
+    
+    ResetSampleRate();
+    
+    if (!is_playing_ && !is_downloading_) {
+        return true;
+    }
+    
+    is_downloading_ = false;
+    is_playing_ = false;
+    
+    auto& board = Board::GetInstance();
+    auto display = board.GetDisplay();
+    if (display) {
+        display->SetMusicInfo("");
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        buffer_cv_.notify_all();
+    }
+    
+    if (download_thread_.joinable()) {
+        download_thread_.join();
+    }
+    
+    if (play_thread_.joinable()) {
+        is_playing_ = false;
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            buffer_cv_.notify_all();
+        }
+        
+        bool thread_finished = false;
+        int wait_count = 0;
+        const int max_wait = 100;
+        
+        while (!thread_finished && wait_count < max_wait) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            wait_count++;
+            
+            if (!play_thread_.joinable()) {
+                thread_finished = true;
+                break;
+            }
+        }
+        
+        if (play_thread_.joinable()) {
+            if (wait_count >= max_wait) {
+                play_thread_.detach();
+            } else {
+                play_thread_.join();
+            }
+        }
+    }
+    
+    if (display && display_mode_ == DISPLAY_MODE_SPECTRUM) {
+        display->stopFft();
+    }
+    
+    return true;
+}
+
+void Esp32Music::DownloadAudioStream(const std::string& music_url) {
+    if (music_url.empty() || music_url.find("http") != 0) {
+        is_downloading_ = false;
+        return;
+    }
+    
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    
+    http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
+    http->SetHeader("Accept", "*/*");
+    http->SetHeader("Range", "bytes=0-");
+    
+    add_auth_headers(http.get());
+    
+    if (!http->Open("GET", music_url)) {
+        is_downloading_ = false;
+        return;
+    }
+    
+    int status_code = http->GetStatusCode();
+    if (status_code != 200 && status_code != 206) {
+        http->Close();
+        is_downloading_ = false;
+        return;
+    }
+    
+    const size_t chunk_size = 4096;
+    char buffer[chunk_size];
+    size_t total_downloaded = 0;
+    
+    while (is_downloading_ && is_playing_) {
+        int bytes_read = http->Read(buffer, chunk_size);
+        if (bytes_read <= 0) {
+            break;
+        }
+        
+        uint8_t* chunk_data = (uint8_t*)heap_caps_malloc(bytes_read, MALLOC_CAP_SPIRAM);
+        if (!chunk_data) {
+            break;
+        }
+        memcpy(chunk_data, buffer, bytes_read);
+        
+        {
+            std::unique_lock<std::mutex> lock(buffer_mutex_);
+            buffer_cv_.wait(lock, [this] { return buffer_size_ < MAX_BUFFER_SIZE || !is_downloading_; });
+            
+            if (is_downloading_) {
+                audio_buffer_.push(AudioChunk(chunk_data, bytes_read));
+                buffer_size_ += bytes_read;
+                total_downloaded += bytes_read;
+                buffer_cv_.notify_one();
+            } else {
+                heap_caps_free(chunk_data);
+                break;
+            }
+        }
+    }
+    
+    http->Close();
+    is_downloading_ = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        buffer_cv_.notify_all();
+    }
+}
+
+void Esp32Music::PlayAudioStream() {
+    current_play_time_ms_ = 0;
+    last_frame_time_ms_ = 0;
+    total_frames_decoded_ = 0;
+    
+    auto codec = Board::GetInstance().GetAudioCodec();
+    if (!codec || !codec->output_enabled()) {
+        is_playing_ = false;
+        return;
+    }
+    
+    if (!mp3_decoder_initialized_) {
+        is_playing_ = false;
+        return;
+    }
+    
+    {
+        std::unique_lock<std::mutex> lock(buffer_mutex_);
+        buffer_cv_.wait(lock, [this] { 
+            return buffer_size_ >= MIN_BUFFER_SIZE || (!is_downloading_ && !audio_buffer_.empty()); 
+        });
+    }
+    
+    ESP_LOGI(TAG, "Starting playback with buffer size: %d", buffer_size_);
+    ESP_LOGI(TAG, "Free heap before playback: %d bytes", esp_get_free_heap_size());
+    
+    size_t total_played = 0;
+    uint8_t* mp3_input_buffer = (uint8_t*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+    if (!mp3_input_buffer) {
+        is_playing_ = false;
+        return;
+    }
+    
+    int bytes_left = 0;
+    uint8_t* read_ptr = nullptr;
+    bool id3_processed = false;
+    
+    while (is_playing_) {
+        auto& app = Application::GetInstance();
+        DeviceState current_state = app.GetDeviceState();
+        
+        if (current_state == kDeviceStateListening || current_state == kDeviceStateSpeaking) {
+            app.ToggleChatState();
+            vTaskDelay(pdMS_TO_TICKS(300));
+            continue;
+        } else if (current_state != kDeviceStateIdle) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        
+        if (!song_name_displayed_ && !current_song_name_.empty()) {
+            auto& board = Board::GetInstance();
+            auto display = board.GetDisplay();
+            if (display) {
+                std::string formatted = "《" + current_song_name_ + "》播放中...";
+                display->SetMusicInfo(formatted.c_str());
+                song_name_displayed_ = true;
+            }
+            
+            if (display && display_mode_ == DISPLAY_MODE_SPECTRUM) {
+                display->start();
+            }
+        }
+        
+        if (bytes_left < 4096) {
+            AudioChunk chunk;
+            
+            {
+                std::unique_lock<std::mutex> lock(buffer_mutex_);
+                if (audio_buffer_.empty()) {
+                    if (!is_downloading_) {
+                        break;
+                    }
+                    buffer_cv_.wait(lock, [this] { return !audio_buffer_.empty() || !is_downloading_; });
+                    if (audio_buffer_.empty()) {
+                        continue;
+                    }
+                }
+                
+                chunk = audio_buffer_.front();
+                audio_buffer_.pop();
+                buffer_size_ -= chunk.size;
+                buffer_cv_.notify_one();
+            }
+            
+            if (chunk.data && chunk.size > 0) {
+                if (bytes_left > 0 && read_ptr != mp3_input_buffer) {
+                    memmove(mp3_input_buffer, read_ptr, bytes_left);
+                }
+                
+                size_t space_available = 8192 - bytes_left;
+                size_t copy_size = std::min(chunk.size, space_available);
+                
+                memcpy(mp3_input_buffer + bytes_left, chunk.data, copy_size);
+                bytes_left += copy_size;
+                read_ptr = mp3_input_buffer;
+                
+                if (!id3_processed && bytes_left >= 10) {
+                    size_t id3_skip = SkipId3Tag(read_ptr, bytes_left);
+                    if (id3_skip > 0) {
+                        read_ptr += id3_skip;
+                        bytes_left -= id3_skip;
+                    }
+                    id3_processed = true;
+                }
+                
+                heap_caps_free(chunk.data);
+            }
+        }
+        
+        int sync_offset = MP3FindSyncWord(read_ptr, bytes_left);
+        if (sync_offset < 0) {
+            bytes_left = 0;
+            continue;
+        }
+        
+        if (sync_offset > 0) {
+            read_ptr += sync_offset;
+            bytes_left -= sync_offset;
+        }
+        
+        int16_t pcm_buffer[2304];
+        int decode_result = MP3Decode(mp3_decoder_, &read_ptr, &bytes_left, pcm_buffer, 0);
+        
+        if (decode_result == 0) {
+            MP3GetLastFrameInfo(mp3_decoder_, &mp3_frame_info_);
+            total_frames_decoded_++;
+            
+            if (mp3_frame_info_.samprate == 0 || mp3_frame_info_.nChans == 0) {
+                continue;
+            }
+            
+            int frame_duration_ms = (mp3_frame_info_.outputSamps * 1000) / 
+                                  (mp3_frame_info_.samprate * mp3_frame_info_.nChans);
+            current_play_time_ms_ += frame_duration_ms;
+            
+            int buffer_latency_ms = 600;
+            UpdateLyricDisplay(current_play_time_ms_ + buffer_latency_ms);
+            
+            if (mp3_frame_info_.outputSamps > 0) {
+                int16_t* final_pcm_data = pcm_buffer;
+                int final_sample_count = mp3_frame_info_.outputSamps;
+                std::vector<int16_t> mono_buffer;
+                
+                if (mp3_frame_info_.nChans == 2) {
+                    int stereo_samples = mp3_frame_info_.outputSamps;
+                    int mono_samples = stereo_samples / 2;
+                    mono_buffer.resize(mono_samples);
+                    
+                    for (int i = 0; i < mono_samples; ++i) {
+                        int left = pcm_buffer[i * 2];
+                        int right = pcm_buffer[i * 2 + 1];
+                        mono_buffer[i] = (int16_t)((left + right) / 2);
+                    }
+                    
+                    final_pcm_data = mono_buffer.data();
+                    final_sample_count = mono_samples;
+                }
+                
+                AudioStreamPacket packet;
+                packet.sample_rate = mp3_frame_info_.samprate;
+                packet.frame_duration = 60;
+                packet.timestamp = 0;
+                
+                size_t pcm_size_bytes = final_sample_count * sizeof(int16_t);
+                packet.payload.resize(pcm_size_bytes);
+                memcpy(packet.payload.data(), final_pcm_data, pcm_size_bytes);
+                
+                if (final_pcm_data_fft == nullptr) {
+                    final_pcm_data_fft = (int16_t*)heap_caps_malloc(
+                        final_sample_count * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+                }
+                
+                memcpy(final_pcm_data_fft, final_pcm_data, final_sample_count * sizeof(int16_t));
+                
+                app.AddAudioData(std::move(packet));
+                total_played += pcm_size_bytes;
+            }
+        } else {
+            if (bytes_left > 1) {
+                read_ptr++;
+                bytes_left--;
+            } else {
+                bytes_left = 0;
+            }
+        }
+    }
+    
+    if (mp3_input_buffer) {
+        heap_caps_free(mp3_input_buffer);
+    }
+    
+    is_playing_ = false;
+    
+    if (display_mode_ == DISPLAY_MODE_SPECTRUM) {
+        auto& board = Board::GetInstance();
+        auto display = board.GetDisplay();
+        if (display) {
+            display->stopFft();
+        }
+    }
+}
+
+void Esp32Music::ClearAudioBuffer() {
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    
+    while (!audio_buffer_.empty()) {
+        AudioChunk chunk = audio_buffer_.front();
+        audio_buffer_.pop();
+        if (chunk.data) {
+            heap_caps_free(chunk.data);
+        }
+    }
+    
+    buffer_size_ = 0;
+}
+
+bool Esp32Music::InitializeMp3Decoder() {
+    mp3_decoder_ = MP3InitDecoder();
+    if (mp3_decoder_ == nullptr) {
+        mp3_decoder_initialized_ = false;
+        return false;
+    }
+    
+    mp3_decoder_initialized_ = true;
+    return true;
+}
+
+void Esp32Music::CleanupMp3Decoder() {
+    if (mp3_decoder_ != nullptr) {
+        MP3FreeDecoder(mp3_decoder_);
+        mp3_decoder_ = nullptr;
+    }
+    mp3_decoder_initialized_ = false;
+}
+
+void Esp32Music::ResetSampleRate() {
+    auto& board = Board::GetInstance();
+    auto codec = board.GetAudioCodec();
+    if (codec && codec->original_output_sample_rate() > 0 && 
+        codec->output_sample_rate() != codec->original_output_sample_rate()) {
+        if (codec->SetOutputSampleRate(-1)) {
+            ESP_LOGI(TAG, "Reset sample rate to original: %d Hz", codec->output_sample_rate());
+        }
+    }
+}
+
+size_t Esp32Music::SkipId3Tag(uint8_t* data, size_t size) {
+    if (!data || size < 10) {
+        return 0;
+    }
+    
+    if (memcmp(data, "ID3", 3) != 0) {
+        return 0;
+    }
+    
+    uint32_t tag_size = ((uint32_t)(data[6] & 0x7F) << 21) |
+                        ((uint32_t)(data[7] & 0x7F) << 14) |
+                        ((uint32_t)(data[8] & 0x7F) << 7)  |
+                        ((uint32_t)(data[9] & 0x7F));
+    
+    size_t total_skip = 10 + tag_size;
+    
+    if (total_skip > size) {
+        total_skip = size;
+    }
+    
+    ESP_LOGI(TAG, "Skipping ID3 tag: %u bytes", (unsigned int)total_skip);
+    return total_skip;
+}
+
+bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
+    ESP_LOGI(TAG, "Downloading lyrics from: %s", lyric_url.c_str());
+    
+    if (lyric_url.empty()) {
+        return false;
+    }
+    
+    const int max_retries = 3;
+    int retry_count = 0;
+    bool success = false;
+    std::string lyric_content;
+    std::string current_url = lyric_url;
+    int redirect_count = 0;
+    const int max_redirects = 5;
+    
+    while (retry_count < max_retries && !success && redirect_count < max_redirects) {
+        if (retry_count > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        
+        auto network = Board::GetInstance().GetNetwork();
+        auto http = network->CreateHttp(0);
+        if (!http) {
+            retry_count++;
+            continue;
+        }
+        
+        http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
+        http->SetHeader("Accept", "text/plain");
+        
+        add_auth_headers(http.get());
+        
+        if (!http->Open("GET", current_url)) {
+            retry_count++;
+            continue;
+        }
+        
+        int status_code = http->GetStatusCode();
+        
+        if (status_code == 301 || status_code == 302 || status_code == 303 || 
+            status_code == 307 || status_code == 308) {
+            http->Close();
+            retry_count++;
+            continue;
+        }
+        
+        if (status_code < 200 || status_code >= 300) {
+            http->Close();
+            retry_count++;
+            continue;
+        }
+        
+        lyric_content.clear();
+        char buffer[1024];
+        int bytes_read;
+        bool read_error = false;
+        int total_read = 0;
+        
+        while (true) {
+            bytes_read = http->Read(buffer, sizeof(buffer) - 1);
+            
+            if (bytes_read > 0) {
+                buffer[bytes_read] = '\0';
+                lyric_content += buffer;
+                total_read += bytes_read;
+            } else if (bytes_read == 0) {
+                success = true;
+                break;
+            } else {
+                if (!lyric_content.empty()) {
+                    success = true;
+                    break;
+                } else {
+                    read_error = true;
+                    break;
+                }
+            }
+        }
+        
+        http->Close();
+        
+        if (read_error) {
+            retry_count++;
+            continue;
+        }
+        
+        if (success) {
+            break;
+        }
+    }
+    
+    if (retry_count >= max_retries) {
+        return false;
+    }
+    
+    return ParseLyrics(lyric_content);
+}
+
+bool Esp32Music::ParseLyrics(const std::string& lyric_content) {
+    ESP_LOGI(TAG, "Parsing lyrics");
+    
+    std::lock_guard<std::mutex> lock(lyrics_mutex_);
+    
+    lyrics_.clear();
+    
+    std::istringstream stream(lyric_content);
+    std::string line;
+    
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        
+        if (line.empty()) {
+            continue;
+        }
+        
+        if (line.length() > 10 && line[0] == '[') {
+            size_t close_bracket = line.find(']');
+            if (close_bracket != std::string::npos) {
+                std::string tag_or_time = line.substr(1, close_bracket - 1);
+                std::string content = line.substr(close_bracket + 1);
+                
+                size_t colon_pos = tag_or_time.find(':');
+                if (colon_pos != std::string::npos) {
+                    std::string left_part = tag_or_time.substr(0, colon_pos);
+                    
+                    bool is_time_format = true;
+                    for (char c : left_part) {
+                        if (!isdigit(c)) {
+                            is_time_format = false;
+                            break;
+                        }
+                    }
+                    
+                    if (!is_time_format) {
+                        continue;
+                    }
+                    
+                    try {
+                        int minutes = std::stoi(tag_or_time.substr(0, colon_pos));
+                        float seconds = std::stof(tag_or_time.substr(colon_pos + 1));
+                        int timestamp_ms = minutes * 60 * 1000 + (int)(seconds * 1000);
+                        
+                        std::string safe_lyric_text;
+                        if (!content.empty()) {
+                            safe_lyric_text = content;
+                            safe_lyric_text.shrink_to_fit();
+                        }
+                        
+                        lyrics_.push_back(std::make_pair(timestamp_ms, safe_lyric_text));
+                    } catch (const std::exception& e) {
+                        ESP_LOGW(TAG, "Failed to parse time: %s", tag_or_time.c_str());
+                    }
+                }
+            }
+        }
+    }
+    
+    std::sort(lyrics_.begin(), lyrics_.end());
+    
+    ESP_LOGI(TAG, "Parsed %d lyric lines", lyrics_.size());
+    return !lyrics_.empty();
+}
+
+void Esp32Music::LyricDisplayThread() {
+    ESP_LOGI(TAG, "Lyric display thread started");
+    
+    if (!DownloadLyrics(current_lyric_url_)) {
+        ESP_LOGE(TAG, "Failed to download lyrics");
+        is_lyric_running_ = false;
+        return;
+    }
+    
+    while (is_lyric_running_ && is_playing_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    
+    ESP_LOGI(TAG, "Lyric display thread finished");
+}
+
+void Esp32Music::UpdateLyricDisplay(int64_t current_time_ms) {
+    std::lock_guard<std::mutex> lock(lyrics_mutex_);
+    
+    if (lyrics_.empty()) {
+        return;
+    }
+    
+    int new_lyric_index = -1;
+    int start_index = (current_lyric_index_.load() >= 0) ? current_lyric_index_.load() : 0;
+    
+    for (int i = start_index; i < (int)lyrics_.size(); i++) {
+        if (lyrics_[i].first <= current_time_ms) {
+            new_lyric_index = i;
+        } else {
+            break;
+        }
+    }
+    
+    if (new_lyric_index == -1) {
+        new_lyric_index = -1;
+    }
+    
+    if (new_lyric_index != current_lyric_index_) {
+        current_lyric_index_ = new_lyric_index;
+        
+        auto& board = Board::GetInstance();
+        auto display = board.GetDisplay();
+        if (display) {
+            std::string lyric_text;
+            
+            if (current_lyric_index_ >= 0 && current_lyric_index_ < (int)lyrics_.size()) {
+                lyric_text = lyrics_[current_lyric_index_].second;
+            }
+            
+            display->SetChatMessage("lyric", lyric_text.c_str());
+        }
+    }
+}
+
+void Esp32Music::SetDisplayMode(DisplayMode mode) {
+    DisplayMode old_mode = display_mode_.load();
+    display_mode_ = mode;
+    
+    ESP_LOGI(TAG, "Display mode changed from %s to %s", 
+            (old_mode == DISPLAY_MODE_SPECTRUM) ? "SPECTRUM" : "LYRICS",
+            (mode == DISPLAY_MODE_SPECTRUM) ? "SPECTRUM" : "LYRICS");
+}

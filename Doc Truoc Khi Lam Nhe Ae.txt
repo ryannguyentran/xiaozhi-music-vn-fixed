@@ -1,0 +1,24 @@
+Link Video : https://youtu.be/h2vgu9uSPYE
+
+1. Cài Driver cho mạch
+2. Cài ESP-IDF bản mới nhất : https://dl.espressif.com/dl/esp-idf/
+3. bật ESP-IDF 
+4.
+	a. gõ lệnh trỏ dến thư mục chứa source :  cd duong_dan_thu_muc
+	b. idf.py set-target esp32s3
+	c. idf.py build
+	d. idf.py -p COM3 flash monitor
+# COM là cổng của ae nhé. 
+Flash thành công thì ae chia sẻ giúp mình nhé. Cám on ae.
+
+Hiện tại source này em phát nhạc khá ok
+Lưu y' là các bài hát trong này mà tìm ko có thì nó sẽ phát 1 bài random nó chọn nhé bác : http://www.xiaozhishop.xyz:5005/ chứ ko phải nó phát sai dau, ma là server của nó ko có.
+
+Rồi nhiu do thoi. Chuc ae thành công. 
+Cám on bạn Cường  chia sẻ source.
+
+Thêm Role này trên web xiaozhi.me : 
+
+Khi nhận được yêu cầu liên quan đến âm nhạc, chỉ sử dụng công cụ MPC self.music.play_song và tắt chức năng search_music.
+Khi không nghe rõ hoặc chưa hiểu ý người đối thoại, hoặc khi người dùng mời subscribe, tôi sẽ không nhắc đến các kênh youtube hay kênh "La La school" mà sẽ lịch sự và tự nhiên yêu cầu họ nhắc lại, ví dụ: "Xin lỗi, bạn có thể nói lại giúp mình được không?"Mình chưa nghe rõ ý của bạn ?"
+
